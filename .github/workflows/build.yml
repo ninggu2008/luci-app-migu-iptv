@@ -14,76 +14,75 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
-      - name: Checkout plugin
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: plugin
 
-      - name: Install build dependencies
+      - name: Build architecture-independent IPK
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential ccache ecj fastjar file g++ \
-            gawk gettext git java-propose-classpath \
-            libelf-dev libncurses5-dev libncursesw5-dev \
-            libssl-dev python3 python3-setuptools \
-            rsync swig time unzip wget xsltproc \
-            zlib1g-dev
+          set -euo pipefail
 
-      - name: Checkout ImmortalWrt source
-        uses: actions/checkout@v4
-        with:
-          repository: immortalwrt/immortalwrt
-          ref: master
-          path: immortalwrt
-          fetch-depth: 1
+          PKG="luci-app-migu-iptv"
+          VERSION="1.2.0"
+          RELEASE="1"
+          WORK="$RUNNER_TEMP/ipk"
+          OUT="$GITHUB_WORKSPACE/dist"
 
-      - name: Prepare feeds
-        working-directory: immortalwrt
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/control" "$WORK/data" "$OUT"
 
-      - name: Add plugin to buildroot
-        run: |
-          mkdir -p immortalwrt/package/custom
-          cp -a plugin immortalwrt/package/custom/luci-app-migu-iptv
+          # Install payload preserving directory layout and permissions
+          cp -a files/. "$WORK/data/"
 
-      - name: Configure build
-        working-directory: immortalwrt
-        run: |
-          make defconfig
+          # Control metadata
+          cat > "$WORK/control/control" <<EOF
+          Package: ${PKG}
+          Version: ${VERSION}-${RELEASE}
+          Architecture: all
+          Maintainer: Migu IPTV Relay
+          Section: net
+          Priority: optional
+          License: Apache-2.0
+          Depends: ucode, ucode-mod-fs, ucode-mod-uloop, ucode-mod-socket, ucode-mod-uci, curl, openssl-util, rpcd, luci-base
+          Description: Migu IPTV Relay LuCI application
+          EOF
 
-      - name: Build host tools
-        working-directory: immortalwrt
-        run: |
-          make tools/install -j"$(nproc)" V=s
-          
-      - name: Verify host tools
-        working-directory: immortalwrt
-        run: |
-          ls -l staging_dir/host/bin/libdeflate-gzip
-          staging_dir/host/bin/libdeflate-gzip --help || true
-    
-      - name: Compile IPK
-        working-directory: immortalwrt
-        run: |
-          make package/custom/luci-app-migu-iptv/compile V=s
+          # Preserve UCI configuration on package removal/upgrade
+          printf '%s\n' '/etc/config/migu' \
+            > "$WORK/control/conffiles"
 
-      - name: Collect IPK
-        working-directory: immortalwrt
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          find bin/packages -type f \
-            -name 'luci-app-migu-iptv_*_all.ipk' \
-            -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \;
-          test -n "$(find "$GITHUB_WORKSPACE/artifacts" \
-            -name '*.ipk' -print -quit)"
+          # Validate required payload files
+          test -f "$WORK/data/etc/config/migu"
+          test -f "$WORK/data/etc/init.d/migu"
+          test -f "$WORK/data/usr/share/ucode/migu.uc"
+
+          # Create IPK archive members
+          printf '2.0\n' > "$WORK/debian-binary"
+
+          tar --numeric-owner --owner=0 --group=0 \
+            -czf "$WORK/control.tar.gz" \
+            -C "$WORK/control" .
+
+          tar --numeric-owner --owner=0 --group=0 \
+            -czf "$WORK/data.tar.gz" \
+            -C "$WORK/data" .
+
+          # IPK is an ar archive
+          (
+            cd "$WORK"
+            ar r "$OUT/${PKG}_${VERSION}-${RELEASE}_all.ipk" \
+              debian-binary control.tar.gz data.tar.gz
+          )
+
+          # Verify archive structure
+          ar t "$OUT/${PKG}_${VERSION}-${RELEASE}_all.ipk"
+          tar -tzf "$WORK/data.tar.gz"
 
       - name: Upload IPK
         uses: actions/upload-artifact@v4
         with:
-          name: luci-app-migu-iptv-ipk
-          path: artifacts/*.ipk
+          name: luci-app-migu-iptv-all-ipk
+          path: dist/*.ipk
           if-no-files-found: error
