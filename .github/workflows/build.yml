@@ -18,23 +18,6 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Inspect repository
-        shell: bash
-        run: |
-          set -eu
-
-          echo "===== Repository root ====="
-          pwd
-
-          echo "===== Top-level files ====="
-          ls -la
-
-          echo "===== Locate files directories ====="
-          find . -type d -name files -not -path './.git/*' -print
-
-          echo "===== Source file listing ====="
-          find . -type f -not -path './.git/*' | sort | head -200
-
       - name: Build architecture-independent IPK
         shell: bash
         run: |
@@ -43,26 +26,38 @@ jobs:
           PKG="luci-app-migu-iptv"
           VERSION="1.2.0"
           RELEASE="1"
+
           WORK="$RUNNER_TEMP/ipk"
           OUT="$GITHUB_WORKSPACE/dist"
           IPK="$OUT/${PKG}_${VERSION}-${RELEASE}_all.ipk"
 
-          echo "===== Locate package files ====="
+          echo "======================================"
+          echo "Building $PKG"
+          echo "Version: $VERSION-$RELEASE"
+          echo "Architecture: all"
+          echo "======================================"
+
+          # ------------------------------------------------------------
+          # Locate source files
+          # ------------------------------------------------------------
 
           if [ -d "$GITHUB_WORKSPACE/files" ]; then
             SRC="$GITHUB_WORKSPACE/files"
           elif [ -d "$GITHUB_WORKSPACE/luci-app-migu-iptv/files" ]; then
             SRC="$GITHUB_WORKSPACE/luci-app-migu-iptv/files"
           else
-            echo "::error::Cannot find the project's files/ directory."
+            echo "::error::Cannot find files/ directory."
             find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
-              -not -path '*/.git/*' | sort | head -300
+              -not -path '*/.git/*' | sort
             exit 1
           fi
 
-          echo "Using source directory: $SRC"
+          echo "Source directory:"
+          echo "$SRC"
 
-          echo "===== Check required files ====="
+          # ------------------------------------------------------------
+          # Check required files
+          # ------------------------------------------------------------
 
           REQUIRED_FILES=(
             "etc/config/migu"
@@ -77,34 +72,45 @@ jobs:
 
           MISSING=0
 
+          echo ""
+          echo "===== Check required files ====="
+
           for f in "${REQUIRED_FILES[@]}"; do
             if [ -f "$SRC/$f" ]; then
-              echo "[OK]      $f"
+              echo "[OK] $f"
             else
-              echo "::error::Missing required file: $SRC/$f"
+              echo "::error::Missing file: $SRC/$f"
               MISSING=1
             fi
           done
 
           if [ "$MISSING" -ne 0 ]; then
+            echo ""
             echo "===== Actual source files ====="
             find "$SRC" -type f | sort
             exit 1
           fi
 
-          echo "===== Prepare package ====="
+          # ------------------------------------------------------------
+          # Prepare package directory
+          # ------------------------------------------------------------
 
           rm -rf "$WORK" "$OUT"
-          mkdir -p "$WORK/control" "$WORK/data" "$OUT"
 
-          # Copy the complete files/ tree.
-          # This preserves the exact OpenWrt installation paths.
+          mkdir -p \
+            "$WORK/control" \
+            "$WORK/data" \
+            "$OUT"
+
+          # Copy all package payload files.
           cp -a "$SRC/." "$WORK/data/"
 
-          # Init script must be executable.
+          # OpenWrt init scripts must be executable.
           chmod 0755 "$WORK/data/etc/init.d/migu"
 
-          echo "===== Create package metadata ====="
+          # ------------------------------------------------------------
+          # Create control metadata
+          # ------------------------------------------------------------
 
           cat > "$WORK/control/control" <<EOF
           Package: ${PKG}
@@ -118,151 +124,232 @@ jobs:
           Description: Migu IPTV Relay LuCI application
           EOF
 
-          # Remove indentation introduced by the YAML heredoc.
+          # Remove indentation introduced by YAML.
           sed -i 's/^[[:space:]]*//' "$WORK/control/control"
 
-          # Preserve UCI configuration.
-          printf '%s\n' '/etc/config/migu' \
+          # Preserve UCI configuration during package upgrades/removal.
+          printf '%s\n' \
+            '/etc/config/migu' \
             > "$WORK/control/conffiles"
 
-          # IPK format version.
-          printf '2.0\n' > "$WORK/debian-binary"
+          # ------------------------------------------------------------
+          # Calculate installed size
+          # ------------------------------------------------------------
 
+          INSTALLED_SIZE=$(du -sk "$WORK/data" | awk '{print $1}')
+
+          echo "Installed size: ${INSTALLED_SIZE} KB"
+
+          printf '%s\n' \
+            "Installed-Size: ${INSTALLED_SIZE}" \
+            >> "$WORK/control/control"
+
+          # ------------------------------------------------------------
+          # Create control.tar.gz
+          # ------------------------------------------------------------
+
+          echo ""
           echo "===== Create control.tar.gz ====="
 
-          tar --format=gnu \
-            --numeric-owner \
-            --owner=0 \
-            --group=0 \
-            -czf "$WORK/control.tar.gz" \
-            -C "$WORK/control" \
-            control conffiles
+          (
+            cd "$WORK/control"
+
+            tar \
+              --format=gnu \
+              --numeric-owner \
+              --owner=0 \
+              --group=0 \
+              --sort=name \
+              -czf "$WORK/control.tar.gz" \
+              .
+          )
+
+          # ------------------------------------------------------------
+          # Create data.tar.gz
+          # ------------------------------------------------------------
 
           echo "===== Create data.tar.gz ====="
 
-          tar --format=gnu \
-            --numeric-owner \
-            --owner=0 \
-            --group=0 \
-            -czf "$WORK/data.tar.gz" \
-            -C "$WORK/data" .
+          (
+            cd "$WORK/data"
 
-          echo "===== Validate gzip archives ====="
+            tar \
+              --format=gnu \
+              --numeric-owner \
+              --owner=0 \
+              --group=0 \
+              --sort=name \
+              -czf "$WORK/data.tar.gz" \
+              .
+          )
 
+          # Validate gzip archives.
           gzip -t "$WORK/control.tar.gz"
           gzip -t "$WORK/data.tar.gz"
 
-          echo "===== Create IPK archive ====="
+          # ------------------------------------------------------------
+          # Create debian-binary
+          # ------------------------------------------------------------
+
+          printf '2.0\n' > "$WORK/debian-binary"
+
+          # ------------------------------------------------------------
+          # Create OpenWrt IPK
+          #
+          # IMPORTANT:
+          # OpenWrt IPK is NOT an ar archive.
+          #
+          # It is:
+          #
+          # gzip(
+          #   tar(
+          #     ./debian-binary
+          #     ./data.tar.gz
+          #     ./control.tar.gz
+          #   )
+          # )
+          # ------------------------------------------------------------
+
+          echo "===== Create IPK ====="
 
           (
             cd "$WORK"
 
-            ar -crD "$IPK" \
-              debian-binary \
-              control.tar.gz \
-              data.tar.gz
+            tar \
+              --format=gnu \
+              --numeric-owner \
+              --owner=0 \
+              --group=0 \
+              --sort=name \
+              -czf "$IPK" \
+              ./debian-binary \
+              ./data.tar.gz \
+              ./control.tar.gz
           )
 
-          echo "===== Validate IPK archive ====="
+          # ------------------------------------------------------------
+          # Validate outer IPK
+          # ------------------------------------------------------------
 
-          ar t "$IPK" | tee "$WORK/ar-members.txt"
+          echo ""
+          echo "===== Validate IPK ====="
 
-          grep -Fxq "debian-binary" "$WORK/ar-members.txt"
-          grep -Fxq "control.tar.gz" "$WORK/ar-members.txt"
-          grep -Fxq "data.tar.gz" "$WORK/ar-members.txt"
+          test -s "$IPK"
 
-          echo "===== Validate IPK version ====="
+          echo "File type:"
+          file "$IPK"
 
-          ar p "$IPK" debian-binary > "$WORK/version-check"
+          echo ""
+          echo "IPK size:"
+          ls -lh "$IPK"
 
-          test "$(tr -d '\r\n' < "$WORK/version-check")" = "2.0"
+          echo ""
+          echo "Outer archive contents:"
 
-          echo "===== Extract IPK for verification ====="
+          tar -tzf "$IPK"
 
-          mkdir -p \
-            "$WORK/verify-control" \
-            "$WORK/verify-data"
+          # Verify required members.
+          tar -tzf "$IPK" | grep -Fxq "./debian-binary"
+          tar -tzf "$IPK" | grep -Fxq "./data.tar.gz"
+          tar -tzf "$IPK" | grep -Fxq "./control.tar.gz"
 
-          ar p "$IPK" control.tar.gz \
-            > "$WORK/verify-control.tar.gz"
+          # ------------------------------------------------------------
+          # Extract outer IPK and validate its components
+          # ------------------------------------------------------------
 
-          ar p "$IPK" data.tar.gz \
-            > "$WORK/verify-data.tar.gz"
+          VERIFY="$WORK/verify"
+          rm -rf "$VERIFY"
+          mkdir -p "$VERIFY"
 
-          tar -xzf "$WORK/verify-control.tar.gz" \
-            -C "$WORK/verify-control"
+          tar -xzf "$IPK" -C "$VERIFY"
 
-          tar -xzf "$WORK/verify-data.tar.gz" \
-            -C "$WORK/verify-data"
+          # Verify debian-binary.
+          test "$(tr -d '\r\n' < "$VERIFY/debian-binary")" = "2.0"
 
-          echo "===== Validate control metadata ====="
+          # Verify inner gzip files.
+          gzip -t "$VERIFY/control.tar.gz"
+          gzip -t "$VERIFY/data.tar.gz"
 
-          CONTROL="$WORK/verify-control/control"
+          # ------------------------------------------------------------
+          # Validate control archive
+          # ------------------------------------------------------------
 
-          test -s "$CONTROL"
+          mkdir -p "$VERIFY/control"
 
-          grep -Fxq "Package: ${PKG}" "$CONTROL"
-          grep -Fxq "Version: ${VERSION}-${RELEASE}" "$CONTROL"
-          grep -Fxq "Architecture: all" "$CONTROL"
+          tar \
+            -xzf "$VERIFY/control.tar.gz" \
+            -C "$VERIFY/control"
+
+          echo ""
+          echo "===== Control metadata ====="
+
+          cat "$VERIFY/control/control"
+
+          echo ""
+
+          grep -Fxq "Package: ${PKG}" \
+            "$VERIFY/control/control"
+
+          grep -Fxq "Version: ${VERSION}-${RELEASE}" \
+            "$VERIFY/control/control"
+
+          grep -Fxq "Architecture: all" \
+            "$VERIFY/control/control"
 
           grep -Fxq "/etc/config/migu" \
-            "$WORK/verify-control/conffiles"
+            "$VERIFY/control/conffiles"
 
-          echo "===== Validate package files ====="
+          # ------------------------------------------------------------
+          # Validate data archive
+          # ------------------------------------------------------------
 
-          test -f "$WORK/verify-data/etc/config/migu"
-          test -f "$WORK/verify-data/etc/init.d/migu"
+          mkdir -p "$VERIFY/data"
 
-          test -f \
-            "$WORK/verify-data/usr/share/luci/menu.d/luci-app-migu-iptv.json"
+          tar \
+            -xzf "$VERIFY/data.tar.gz" \
+            -C "$VERIFY/data"
 
-          test -f \
-            "$WORK/verify-data/usr/share/rpcd/acl.d/luci-app-migu-iptv.json"
+          echo ""
+          echo "===== Validate installed files ====="
 
-          test -f \
-            "$WORK/verify-data/usr/share/rpcd/ucode/migu"
+          for f in "${REQUIRED_FILES[@]}"; do
+            if [ -f "$VERIFY/data/$f" ]; then
+              echo "[OK] $f"
+            else
+              echo "::error::Missing packaged file: $f"
+              exit 1
+            fi
+          done
 
-          test -f \
-            "$WORK/verify-data/usr/share/ucode/migu.uc"
-
-          test -f \
-            "$WORK/verify-data/www/luci-static/resources/view/migu/config.js"
-
-          test -f \
-            "$WORK/verify-data/www/luci-static/resources/view/migu/status.js"
-
-          echo "===== Check permissions ====="
-
+          # Verify init script permission.
           INIT_MODE=$(stat -c '%a' \
-            "$WORK/verify-data/etc/init.d/migu")
+            "$VERIFY/data/etc/init.d/migu")
 
-          echo "init.d/migu permissions: $INIT_MODE"
+          echo ""
+          echo "init.d/migu mode: $INIT_MODE"
 
           test "$INIT_MODE" = "755"
 
-          echo "===== Package information ====="
+          # ------------------------------------------------------------
+          # Final information
+          # ------------------------------------------------------------
 
-          file "$IPK"
-
-          ls -lh "$IPK"
-
-          echo "===== IPK archive members ====="
-
-          cat "$WORK/ar-members.txt"
-
-          echo "===== Control metadata ====="
-
-          cat "$CONTROL"
-
-          echo "===== Data files ====="
-
-          find "$WORK/verify-data" -type f | sort
-
+          echo ""
           echo "======================================"
           echo "IPK BUILD SUCCESSFUL"
           echo "======================================"
-          echo "Output:"
+
+          echo ""
+          echo "Output file:"
           echo "$IPK"
+
+          echo ""
+          echo "File information:"
+          file "$IPK"
+
+          echo ""
+          echo "Archive contents:"
+          tar -tzf "$IPK"
 
       - name: Upload IPK artifact
         uses: actions/upload-artifact@v4
