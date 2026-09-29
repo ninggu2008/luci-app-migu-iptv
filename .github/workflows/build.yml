@@ -1,0 +1,78 @@
+
+name: Build Migu IPTV IPK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache ecj fastjar file g++ \
+            gawk gettext git java-propose-classpath \
+            libelf-dev libncurses5-dev libncursesw5-dev \
+            libssl-dev python3 python3-setuptools \
+            rsync swig time unzip wget xsltproc \
+            zlib1g-dev
+
+      - name: Checkout ImmortalWrt source
+        uses: actions/checkout@v4
+        with:
+          repository: immortalwrt/immortalwrt
+          ref: master
+          path: immortalwrt
+          fetch-depth: 1
+
+      - name: Prepare feeds
+        working-directory: immortalwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Add plugin to buildroot
+        run: |
+          mkdir -p immortalwrt/package/custom
+          cp -a plugin immortalwrt/package/custom/luci-app-migu-iptv
+
+      - name: Configure build
+        working-directory: immortalwrt
+        run: |
+          make defconfig
+
+      - name: Compile IPK
+        working-directory: immortalwrt
+        run: |
+          make package/custom/luci-app-migu-iptv/compile V=s
+
+      - name: Collect IPK
+        working-directory: immortalwrt
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          find bin/packages -type f \
+            -name 'luci-app-migu-iptv_*_all.ipk' \
+            -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \;
+          test -n "$(find "$GITHUB_WORKSPACE/artifacts" \
+            -name '*.ipk' -print -quit)"
+
+      - name: Upload IPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-migu-iptv-ipk
+          path: artifacts/*.ipk
+          if-no-files-found: error
