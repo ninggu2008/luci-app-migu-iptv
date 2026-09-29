@@ -1,25 +1,149 @@
-# 生成控制信息归档
-tar --format=gnu --numeric-owner --owner=0 --group=0 \
-  -czf "$WORK/control.tar.gz" \
-  -C "$WORK/control" control conffiles
+name: Build Migu IPTV IPK
 
-# 生成程序文件归档
-tar --format=gnu --numeric-owner --owner=0 --group=0 \
-  -czf "$WORK/data.tar.gz" \
-  -C "$WORK/data" .
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
 
-# 写入 IPK 格式版本
-printf '2.0\n' > "$WORK/debian-binary"
+permissions:
+  contents: read
 
-# 创建 IPK，固定归档成员顺序
-(
-  cd "$WORK"
-  rm -f "$OUT/${PKG}_${VERSION}-${RELEASE}_all.ipk"
-  ar -crD "$OUT/${PKG}_${VERSION}-${RELEASE}_all.ipk" \
-    debian-binary control.tar.gz data.tar.gz
-)
+jobs:
+  build:
+    runs-on: ubuntu-22.04
 
-# 验证
-gzip -t "$WORK/control.tar.gz"
-gzip -t "$WORK/data.tar.gz"
-ar t "$OUT/${PKG}_${VERSION}-${RELEASE}_all.ipk"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build architecture-independent IPK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PKG="luci-app-migu-iptv"
+          VERSION="1.2.0"
+          RELEASE="1"
+          WORK="$RUNNER_TEMP/ipk"
+          OUT="$GITHUB_WORKSPACE/dist"
+          IPK="$OUT/${PKG}_${VERSION}-${RELEASE}_all.ipk"
+
+          echo "Preparing package..."
+
+          # Clean previous build
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/control" "$WORK/data" "$OUT"
+
+          # Check source files
+          test -d files
+          test -f files/etc/config/migu
+          test -f files/etc/init.d/migu
+          test -f files/usr/share/luci/menu.d/luci-app-migu-iptv.json
+          test -f files/usr/share/rpcd/acl.d/luci-app-migu-iptv.json
+          test -f files/usr/share/rpcd/ucode/migu
+          test -f files/ucode/migu.uc
+          test -f files/www/luci-static/resources/view/migu/config.js
+          test -f files/www/luci-static/resources/view/migu/status.js
+
+          # Copy payload while preserving file permissions
+          cp -a files/. "$WORK/data/"
+
+          # Ensure init script is executable
+          chmod 0755 "$WORK/data/etc/init.d/migu"
+
+          # Package metadata
+          cat > "$WORK/control/control" <<EOF
+          Package: ${PKG}
+          Version: ${VERSION}-${RELEASE}
+          Architecture: all
+          Maintainer: Migu IPTV Relay
+          Section: net
+          Priority: optional
+          License: Apache-2.0
+          Depends: ucode, ucode-mod-fs, ucode-mod-uloop, ucode-mod-socket, ucode-mod-uci, curl, openssl-util, rpcd, luci-base
+          Description: Migu IPTV Relay LuCI application
+          EOF
+
+          # Remove leading indentation from heredoc-generated metadata
+          sed -i 's/^[[:space:]]*//' "$WORK/control/control"
+
+          # Preserve UCI configuration on upgrade/removal
+          printf '%s\n' '/etc/config/migu' > "$WORK/control/conffiles"
+
+          # IPK format version
+          printf '2.0\n' > "$WORK/debian-binary"
+
+          # Create control archive
+          tar --format=gnu \
+            --numeric-owner --owner=0 --group=0 \
+            -czf "$WORK/control.tar.gz" \
+            -C "$WORK/control" control conffiles
+
+          # Create data archive
+          tar --format=gnu \
+            --numeric-owner --owner=0 --group=0 \
+            -czf "$WORK/data.tar.gz" \
+            -C "$WORK/data" .
+
+          # Validate compressed archives
+          gzip -t "$WORK/control.tar.gz"
+          gzip -t "$WORK/data.tar.gz"
+
+          # Build IPK ar archive in the expected order
+          (
+            cd "$WORK"
+            ar -crD "$IPK" \
+              debian-binary \
+              control.tar.gz \
+              data.tar.gz
+          )
+
+          echo "Checking IPK archive..."
+
+          # Validate archive members
+          ar t "$IPK" | tee "$WORK/ar-members.txt"
+
+          grep -Fxq "debian-binary" "$WORK/ar-members.txt"
+          grep -Fxq "control.tar.gz" "$WORK/ar-members.txt"
+          grep -Fxq "data.tar.gz" "$WORK/ar-members.txt"
+
+          # Validate IPK version
+          ar p "$IPK" debian-binary > "$WORK/version-check"
+          test "$(tr -d '\r\n' < "$WORK/version-check")" = "2.0"
+
+          # Extract and validate control metadata
+          mkdir -p "$WORK/verify-control" "$WORK/verify-data"
+
+          tar -xzf "$WORK/control.tar.gz" -C "$WORK/verify-control"
+          tar -xzf "$WORK/data.tar.gz" -C "$WORK/verify-data"
+
+          test -s "$WORK/verify-control/control"
+          grep -Fxq "Package: ${PKG}" "$WORK/verify-control/control"
+          grep -Fxq "Version: ${VERSION}-${RELEASE}" "$WORK/verify-control/control"
+          grep -Fxq "Architecture: all" "$WORK/verify-control/control"
+          grep -Fxq "/etc/config/migu" "$WORK/verify-control/conffiles"
+
+          # Verify essential payload files
+          test -f "$WORK/verify-data/etc/config/migu"
+          test -f "$WORK/verify-data/etc/init.d/migu"
+          test -f "$WORK/verify-data/usr/share/rpcd/ucode/migu"
+          test -f "$WORK/verify-data/ucode/migu.uc"
+
+          # Display package information
+          echo "Package built successfully:"
+          file "$IPK"
+          ls -lh "$IPK"
+          echo "Archive members:"
+          cat "$WORK/ar-members.txt"
+          echo "Control metadata:"
+          cat "$WORK/verify-control/control"
+
+      - name: Upload IPK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-migu-iptv-all-ipk
+          path: dist/luci-app-migu-iptv_1.2.0-1_all.ipk
+          if-no-files-found: error
+          retention-days: 30
