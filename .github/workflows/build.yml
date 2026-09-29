@@ -55,6 +55,17 @@ jobs:
         run: |
           make defconfig
 
+      - name: Build host tools
+        working-directory: immortalwrt
+        run: |
+          make tools/install -j"$(nproc)" V=s
+          
+      - name: Verify host tools
+        working-directory: immortalwrt
+        run: |
+          ls -l staging_dir/host/bin/libdeflate-gzip
+          staging_dir/host/bin/libdeflate-gzip --help || true
+    
       - name: Compile IPK
         working-directory: immortalwrt
         run: |
