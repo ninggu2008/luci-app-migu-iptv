@@ -1,3 +1,4 @@
+
 name: Build Migu IPTV IPK
 
 on:
@@ -18,6 +19,19 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      - name: Inspect repository
+        shell: bash
+        run: |
+          set -eu
+          echo "===== Repository root ====="
+          pwd
+          echo "===== Top-level files ====="
+          ls -la
+          echo "===== Locate files directories ====="
+          find . -type d -name files -not -path './.git/*' -print
+          echo "===== Source file listing ====="
+          find . -type f -not -path './.git/*' | sort | head -200
+
       - name: Build architecture-independent IPK
         shell: bash
         run: |
@@ -30,30 +44,59 @@ jobs:
           OUT="$GITHUB_WORKSPACE/dist"
           IPK="$OUT/${PKG}_${VERSION}-${RELEASE}_all.ipk"
 
-          echo "Preparing package..."
+          echo "===== Locate package files ====="
 
-          # Clean previous build
+          if [ -d "$GITHUB_WORKSPACE/files" ]; then
+            SRC="$GITHUB_WORKSPACE/files"
+          elif [ -d "$GITHUB_WORKSPACE/luci-app-migu-iptv/files" ]; then
+            SRC="$GITHUB_WORKSPACE/luci-app-migu-iptv/files"
+          else
+            echo "::error::Cannot find the project's files/ directory."
+            echo "Repository contents:"
+            find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
+              -not -path '*/.git/*' | sort | head -300
+            exit 1
+          fi
+
+          echo "Using source directory: $SRC"
+          echo "===== Check required files ====="
+
+          REQUIRED_FILES=(
+            "etc/config/migu"
+            "etc/init.d/migu"
+            "usr/share/luci/menu.d/luci-app-migu-iptv.json"
+            "usr/share/rpcd/acl.d/luci-app-migu-iptv.json"
+            "usr/share/rpcd/ucode/migu"
+            "ucode/migu.uc"
+            "www/luci-static/resources/view/migu/config.js"
+            "www/luci-static/resources/view/migu/status.js"
+          )
+
+          MISSING=0
+
+          for f in "${REQUIRED_FILES[@]}"; do
+            if [ -f "$SRC/$f" ]; then
+              echo "[OK]      $f"
+            else
+              echo "::error::Missing required file: $SRC/$f"
+              MISSING=1
+            fi
+          done
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "Actual source files:"
+            find "$SRC" -type f | sort
+            exit 1
+          fi
+
+          echo "===== Prepare package ====="
+
           rm -rf "$WORK" "$OUT"
           mkdir -p "$WORK/control" "$WORK/data" "$OUT"
 
-          # Check source files
-          test -d files
-          test -f files/etc/config/migu
-          test -f files/etc/init.d/migu
-          test -f files/usr/share/luci/menu.d/luci-app-migu-iptv.json
-          test -f files/usr/share/rpcd/acl.d/luci-app-migu-iptv.json
-          test -f files/usr/share/rpcd/ucode/migu
-          test -f files/ucode/migu.uc
-          test -f files/www/luci-static/resources/view/migu/config.js
-          test -f files/www/luci-static/resources/view/migu/status.js
-
-          # Copy payload while preserving file permissions
-          cp -a files/. "$WORK/data/"
-
-          # Ensure init script is executable
+          cp -a "$SRC/." "$WORK/data/"
           chmod 0755 "$WORK/data/etc/init.d/migu"
 
-          # Package metadata
           cat > "$WORK/control/control" <<EOF
           Package: ${PKG}
           Version: ${VERSION}-${RELEASE}
@@ -66,32 +109,28 @@ jobs:
           Description: Migu IPTV Relay LuCI application
           EOF
 
-          # Remove leading indentation from heredoc-generated metadata
           sed -i 's/^[[:space:]]*//' "$WORK/control/control"
 
-          # Preserve UCI configuration on upgrade/removal
-          printf '%s\n' '/etc/config/migu' > "$WORK/control/conffiles"
+          printf '%s\n' '/etc/config/migu' \
+            > "$WORK/control/conffiles"
 
-          # IPK format version
           printf '2.0\n' > "$WORK/debian-binary"
 
-          # Create control archive
           tar --format=gnu \
             --numeric-owner --owner=0 --group=0 \
             -czf "$WORK/control.tar.gz" \
             -C "$WORK/control" control conffiles
 
-          # Create data archive
           tar --format=gnu \
             --numeric-owner --owner=0 --group=0 \
             -czf "$WORK/data.tar.gz" \
             -C "$WORK/data" .
 
-          # Validate compressed archives
+          echo "===== Validate compressed archives ====="
           gzip -t "$WORK/control.tar.gz"
           gzip -t "$WORK/data.tar.gz"
 
-          # Build IPK ar archive in the expected order
+          echo "===== Create IPK ====="
           (
             cd "$WORK"
             ar -crD "$IPK" \
@@ -100,45 +139,46 @@ jobs:
               data.tar.gz
           )
 
-          echo "Checking IPK archive..."
-
-          # Validate archive members
+          echo "===== Validate IPK archive ====="
           ar t "$IPK" | tee "$WORK/ar-members.txt"
 
           grep -Fxq "debian-binary" "$WORK/ar-members.txt"
           grep -Fxq "control.tar.gz" "$WORK/ar-members.txt"
           grep -Fxq "data.tar.gz" "$WORK/ar-members.txt"
 
-          # Validate IPK version
           ar p "$IPK" debian-binary > "$WORK/version-check"
           test "$(tr -d '\r\n' < "$WORK/version-check")" = "2.0"
 
-          # Extract and validate control metadata
           mkdir -p "$WORK/verify-control" "$WORK/verify-data"
 
-          tar -xzf "$WORK/control.tar.gz" -C "$WORK/verify-control"
-          tar -xzf "$WORK/data.tar.gz" -C "$WORK/verify-data"
+          ar p "$IPK" control.tar.gz > "$WORK/verify-control.tar.gz"
+          ar p "$IPK" data.tar.gz > "$WORK/verify-data.tar.gz"
 
-          test -s "$WORK/verify-control/control"
-          grep -Fxq "Package: ${PKG}" "$WORK/verify-control/control"
-          grep -Fxq "Version: ${VERSION}-${RELEASE}" "$WORK/verify-control/control"
-          grep -Fxq "Architecture: all" "$WORK/verify-control/control"
-          grep -Fxq "/etc/config/migu" "$WORK/verify-control/conffiles"
+          tar -xzf "$WORK/verify-control.tar.gz" \
+            -C "$WORK/verify-control"
+          tar -xzf "$WORK/verify-data.tar.gz" \
+            -C "$WORK/verify-data"
 
-          # Verify essential payload files
+          CONTROL="$WORK/verify-control/control"
+
+          grep -Fxq "Package: ${PKG}" "$CONTROL"
+          grep -Fxq "Version: ${VERSION}-${RELEASE}" "$CONTROL"
+          grep -Fxq "Architecture: all" "$CONTROL"
+          grep -Fxq "/etc/config/migu" \
+            "$WORK/verify-control/conffiles"
+
           test -f "$WORK/verify-data/etc/config/migu"
           test -f "$WORK/verify-data/etc/init.d/migu"
           test -f "$WORK/verify-data/usr/share/rpcd/ucode/migu"
           test -f "$WORK/verify-data/ucode/migu.uc"
 
-          # Display package information
-          echo "Package built successfully:"
+          echo "===== Build successful ====="
           file "$IPK"
           ls -lh "$IPK"
-          echo "Archive members:"
+          echo "===== Control metadata ====="
+          cat "$CONTROL"
+          echo "===== Archive members ====="
           cat "$WORK/ar-members.txt"
-          echo "Control metadata:"
-          cat "$WORK/verify-control/control"
 
       - name: Upload IPK artifact
         uses: actions/upload-artifact@v4
